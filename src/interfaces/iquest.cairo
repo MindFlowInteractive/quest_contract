@@ -83,4 +83,10 @@ pub trait ILogicQuestPuzzle<TContractState> {
     fn get_total_puzzles(self: @TContractState) -> u32;
     fn get_contract_version(self: @TContractState) -> u32;
     fn is_authorized_creator(self: @TContractState, address: ContractAddress) -> bool;
+    
+    // Verification system integration functions
+    fn set_verification_contract(ref self: TContractState, verification_contract: ContractAddress);
+    fn set_verification_required(ref self: TContractState, required: bool);
+    fn is_verification_required(self: @TContractState) -> bool;
+    fn get_verification_contract(self: @TContractState) -> ContractAddress;
 }

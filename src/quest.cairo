@@ -20,6 +20,7 @@ pub mod LogicQuestPuzzle {
         PlayerAttempt, Puzzle, Question, QuestionType, RewardParameters, options,
     };
     use crate::interfaces::iquest::ILogicQuestPuzzle;
+    use crate::interfaces::iverification::{ISolutionVerificationDispatcher, ISolutionVerificationDispatcherTrait};
 
     // Constants
     const BASE_REWARD: u256 = 1_000_000_000_000_000; // 0.001 STRK base reward
@@ -31,7 +32,6 @@ pub mod LogicQuestPuzzle {
     const REWARD_DECAY_FACTOR: u256 =
         800; // 80% decay factor for repeated attempts (divide by 1000)
     const TWO_STARK: u256 = 2_000_000_000_000_000_000;
-
 
     // components definition
     component!(path: AccessControlComponent, storage: accesscontrol, event: AccessControlEvent);
@@ -46,7 +46,6 @@ pub mod LogicQuestPuzzle {
     // SRC5
     #[abi(embed_v0)]
     impl SRC5Impl = SRC5Component::SRC5Impl<ContractState>;
-
 
     // Events
     #[event]
@@ -144,7 +143,6 @@ pub mod LogicQuestPuzzle {
         new_version: u32,
     }
 
-
     // Contract storage
     #[storage]
     struct Storage {
@@ -169,6 +167,9 @@ pub mod LogicQuestPuzzle {
         // Anti-gaming and security
         blacklisted_players: Map<ContractAddress, bool>,
         paused: bool,
+        // Verification system integration
+        verification_contract: ContractAddress,
+        verification_required: bool,
         #[substorage(v0)]
         pub accesscontrol: AccessControlComponent::Storage,
         #[substorage(v0)]
@@ -178,17 +179,22 @@ pub mod LogicQuestPuzzle {
     // Constructor
     #[constructor]
     fn constructor(
-        ref self: ContractState, token_addr: ContractAddress, admin_address: ContractAddress,
+        ref self: ContractState,
+        token_addr: ContractAddress,
+        admin_address: ContractAddress,
+        verification_contract: ContractAddress,
     ) {
         self.admin.write(admin_address);
         self.puzzles_count.write(0);
         self.current_contract_version.write(1);
         self.token_addr.write(token_addr);
         self.paused.write(false);
+        // Set verification contract address
+        self.verification_contract.write(verification_contract);
+        self.verification_required.write(true);
         // Authorize admin as a creator
         self.authorized_creators.write(admin_address, true);
     }
-
 
     // Modifiers
     #[generate_trait]
@@ -206,7 +212,6 @@ pub mod LogicQuestPuzzle {
             );
         }
     }
-
 
     // Implementation
     #[abi(embed_v0)]
@@ -233,7 +238,6 @@ pub mod LogicQuestPuzzle {
             self.current_contract_version.write(new_version);
             //self.emit(ContractVersionUpdated { old_version, new_version });
         }
-
 
         // Creator functions
         fn create_puzzle(
@@ -285,7 +289,6 @@ pub mod LogicQuestPuzzle {
             puzzle_id
         }
 
-
         fn add_question(
             ref self: ContractState,
             puzzle_id: u32,
@@ -308,7 +311,11 @@ pub mod LogicQuestPuzzle {
             // Create new question
             let question_id = self.questions_count.read(puzzle_id) + 1;
             let new_question = Question {
-                id: question_id, content, question_type, difficulty, points,
+                id: question_id,
+                content,
+                question_type,
+                difficulty,
+                points,
             };
 
             // Store the question
@@ -367,11 +374,10 @@ pub mod LogicQuestPuzzle {
             //         option_id,
             //         is_correct,
             //     }
-            //);
+            // );
 
             option_id
         }
-
 
         // Query functions
         fn get_puzzle(self: @ContractState, puzzle_id: u32) -> Puzzle {
@@ -395,7 +401,6 @@ pub mod LogicQuestPuzzle {
             );
             self.options.read((puzzle_id, question_id, option_id))
         }
-
 
         fn get_puzzle_questions_count(self: @ContractState, puzzle_id: u32) -> u32 {
             assert(puzzle_id <= self.puzzles_count.read(), 'Invalid puzzle ID');
@@ -438,65 +443,129 @@ pub mod LogicQuestPuzzle {
             let puzzle = self.get_puzzle(puzzle_id);
             assert(puzzle.id == puzzle_id, 'Invalid puzzle');
 
-            // Check if the player is on cooldown for this puzzle
-            let player_attempt = self.player_attempts.read((player, puzzle_id));
-            let current_time = get_block_timestamp();
+            // Check if verification is required
+            if self.verification_required.read() {
+                // Verify solution through verification contract
+                let verification_dispatcher = ISolutionVerificationDispatcher {
+                    contract_address: self.verification_contract.read(),
+                };
 
-            if player_attempt.attempt_count > 0 {
-                assert(
-                    current_time >= player_attempt.last_attempt_timestamp
-                        + self.reward_parameters.read().cooldown_period,
-                    'Puzzle on cooldown',
+                // Check if solution is verified
+                let is_verified = verification_dispatcher.is_solution_verified(player, puzzle_id);
+                assert(is_verified, 'Solution not verified');
+
+                // Get solution proof to extract score and time
+                let proof = verification_dispatcher.get_solution_proof(player, puzzle_id);
+
+                // Calculate reward based on verified score and time
+                let reward_amount = self.calculate_reward(
+                    puzzle_id, proof.score, proof.time_taken, player,
                 );
-            }
 
-            let player_attempt = self.get_player_attempts(player, puzzle_id);
-            // Calculate the reward amount
-            let reward_amount = self
-                .calculate_reward(
-                    puzzle_id, player_attempt.best_score, player_attempt.best_time, player,
-                );
+                // Ensure the reward pool has sufficient funds
+                let pool_check = self.has_sufficient_pool(reward_amount);
+                assert(pool_check, 'Insufficient pool funds');
 
-            // Ensure the reward pool has sufficient funds
-            let pool_check = self.has_sufficient_pool(reward_amount);
-            assert(pool_check, 'Insufficient pool funds');
+                // Get player attempt data
+                let player_attempt = self.get_player_attempts(player, puzzle_id);
 
-            self
-                .update_player_attempt(
-                    player_attempt.best_score,
+                // Update player attempt with verified data
+                self.update_player_attempt(
+                    proof.score,
                     player_attempt,
-                    player_attempt.best_time,
+                    proof.time_taken,
                     player,
                     puzzle_id,
                     reward_amount,
-                    current_time,
+                    get_block_timestamp(),
                 );
 
-            // Update global stats
-            self.reward_pool_balance.write(self.reward_pool_balance.read() - reward_amount);
-            self
-                .total_rewards_distributed
-                .write(self.total_rewards_distributed.read() + reward_amount);
+                // Update global stats
+                self.reward_pool_balance.write(self.reward_pool_balance.read() - reward_amount);
+                self.total_rewards_distributed.write(
+                    self.total_rewards_distributed.read() + reward_amount,
+                );
 
-            // Transfer STRK tokens to the player
-            let reward = self.reward_players(player, reward_amount);
-            assert(reward == 'REWARDED', 'reward player failed');
+                // Transfer STRK tokens to the player
+                let reward = self.reward_players(player, reward_amount);
+                assert(reward == 'REWARDED', 'reward player failed');
 
-            // Emit event
-            self
-                .emit(
+                // Emit event
+                self.emit(
                     Event::RewardPaid(
                         RewardPaid {
                             player,
                             puzzle_id,
                             reward_amount,
-                            time_taken: player_attempt.best_time,
-                            completion_timestamp: current_time,
+                            time_taken: proof.time_taken,
+                            completion_timestamp: get_block_timestamp(),
                         },
                     ),
                 );
 
-            reward_amount
+                reward_amount
+            } else {
+                // Original reward logic without verification
+                // Check if the player is on cooldown for this puzzle
+                let player_attempt = self.player_attempts.read((player, puzzle_id));
+                let current_time = get_block_timestamp();
+
+                if player_attempt.attempt_count > 0 {
+                    assert(
+                        current_time >= player_attempt.last_attempt_timestamp
+                            + self.reward_parameters.read().cooldown_period,
+                        'Puzzle on cooldown',
+                    );
+                }
+
+                let player_attempt = self.get_player_attempts(player, puzzle_id);
+                // Calculate the reward amount
+                let reward_amount = self
+                    .calculate_reward(
+                        puzzle_id, player_attempt.best_score, player_attempt.best_time, player,
+                    );
+
+                // Ensure the reward pool has sufficient funds
+                let pool_check = self.has_sufficient_pool(reward_amount);
+                assert(pool_check, 'Insufficient pool funds');
+
+                self
+                    .update_player_attempt(
+                        player_attempt.best_score,
+                        player_attempt,
+                        player_attempt.best_time,
+                        player,
+                        puzzle_id,
+                        reward_amount,
+                        current_time,
+                    );
+
+                // Update global stats
+                self.reward_pool_balance.write(self.reward_pool_balance.read() - reward_amount);
+                self
+                    .total_rewards_distributed
+                    .write(self.total_rewards_distributed.read() + reward_amount);
+
+                // Transfer STRK tokens to the player
+                let reward = self.reward_players(player, reward_amount);
+                assert(reward == 'REWARDED', 'reward player failed');
+
+                // Emit event
+                self
+                    .emit(
+                        Event::RewardPaid(
+                            RewardPaid {
+                                player,
+                                puzzle_id,
+                                reward_amount,
+                                time_taken: player_attempt.best_time,
+                                completion_timestamp: current_time,
+                            },
+                        ),
+                    );
+
+                reward_amount
+            }
         }
 
         fn update_player_attempt(
@@ -661,6 +730,29 @@ pub mod LogicQuestPuzzle {
                     ),
                 );
         }
+
+        // Add function to set verification contract address
+        fn set_verification_contract(ref self: ContractState, verification_contract: ContractAddress) {
+            self.only_admin();
+            assert(verification_contract.is_non_zero(), 'Invalid contract address');
+            self.verification_contract.write(verification_contract);
+        }
+
+        // Add function to toggle verification requirement
+        fn set_verification_required(ref self: ContractState, required: bool) {
+            self.only_admin();
+            self.verification_required.write(required);
+        }
+
+        // Add function to check if verification is required
+        fn is_verification_required(self: @ContractState) -> bool {
+            self.verification_required.read()
+        }
+
+        // Add function to get verification contract address
+        fn get_verification_contract(self: @ContractState) -> ContractAddress {
+            self.verification_contract.read()
+        }
     }
 
     #[generate_trait]
@@ -763,4 +855,3 @@ pub mod LogicQuestPuzzle {
         }
     }
 }
-
