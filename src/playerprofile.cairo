@@ -12,7 +12,11 @@ pub mod LogicQuestPlayerProfile {
         Map, StorageMapReadAccess, StorageMapWriteAccess, StoragePointerReadAccess,
         StoragePointerWriteAccess,
     };
-    use starknet::{ContractAddress, get_block_timestamp, get_caller_address};
+    use starknet::{ContractAddress, get_block_timestamp, get_caller_address, contract_address_const};
+use starknet::contract_address_const;
+use starknet::contract_address::ContractAddressZeroable;
+use core::option::OptionTrait;
+use core::traits::Into;
 
 
     // Events
@@ -24,6 +28,17 @@ pub mod LogicQuestPlayerProfile {
         PuzzleCompleted: PuzzleCompleted,
         LevelUnlocked: LevelUnlocked,
         StreakUpdated: StreakUpdated,
+        TokensSpent: TokensSpent,
+        FeatureUnlocked: FeatureUnlocked,
+        HintPurchased: HintPurchased,
+        BundlePurchased: BundlePurchased,
+        SaleStarted: SaleStarted,
+        SaleEnded: SaleEnded,
+        TokensStaked: TokensStaked,
+        TokensUnstaked: TokensUnstaked,
+        RewardsClaimed: RewardsClaimed,
+        ReferralRegistered: ReferralRegistered,
+        ReferralRewardPaid: ReferralRewardPaid,
     }
 
     #[derive(Drop, starknet::Event)]
@@ -69,6 +84,97 @@ pub mod LogicQuestPlayerProfile {
         streak_days: u32,
     }
 
+    #[derive(Drop, starknet::Event)]
+    struct TokensSpent {
+        #[key]
+        player: ContractAddress,
+        amount: u256,
+        feature_type: felt252,
+        feature_id: u32,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    struct FeatureUnlocked {
+        #[key]
+        player: ContractAddress,
+        feature_type: felt252,
+        feature_id: u32,
+        cost: u256,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    struct HintPurchased {
+        #[key]
+        player: ContractAddress,
+        puzzle_id: u32,
+        hint_level: u8,
+        hint_text: felt252,
+        cost: u256,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    struct BundlePurchased {
+        #[key]
+        player: ContractAddress,
+        bundle_id: u32,
+        items: Array<u32>,
+        total_cost: u256,
+        discount: u256,
+    }
+    
+    #[derive(Drop, starknet::Event)]
+    struct SaleStarted {
+        sale_id: u32,
+        item_type: felt252,
+        item_id: u32,
+        discount_percent: u8,
+        start_time: u64,
+        end_time: u64,
+    }
+    
+    #[derive(Drop, starknet::Event)]
+    struct SaleEnded {
+        sale_id: u32,
+    }
+    
+    #[derive(Drop, starknet::Event)]
+    struct TokensStaked {
+        #[key]
+        player: ContractAddress,
+        amount: u256,
+        unlock_time: u64,
+    }
+    
+    #[derive(Drop, starknet::Event)]
+    struct TokensUnstaked {
+        #[key]
+        player: ContractAddress,
+        amount: u256,
+        reward: u256,
+    }
+    
+    #[derive(Drop, starknet::Event)]
+    struct RewardsClaimed {
+        #[key]
+        player: ContractAddress,
+        amount: u256,
+    }
+    
+    #[derive(Drop, starknet::Event)]
+    struct ReferralRegistered {
+        #[key]
+        referrer: ContractAddress,
+        referee: ContractAddress,
+    }
+    
+    #[derive(Drop, starknet::Event)]
+    struct ReferralRewardPaid {
+        #[key]
+        referrer: ContractAddress,
+        amount: u256,
+        referee: ContractAddress,
+    }
+
     // Contract storage
     #[storage]
     struct Storage {
@@ -90,8 +196,41 @@ pub mod LogicQuestPlayerProfile {
         >, // Maps (player, level_id) to unlock status
         player_level_count: Map<ContractAddress, u32>, // Maps player to number of unlocked levels
         player_levels: Map<(ContractAddress, u32), u32>, // Maps (player, index) to level_id
-        // Token interface
+        // Token interface and spending
         token_contract: ContractAddress,
+        // Feature costs
+        hint_costs: Map<u8, u256>, // hint_level -> cost
+        feature_costs: Map<felt252, u256>, // feature_type -> cost
+        // Player unlocks and purchases
+        player_hints: Map<(ContractAddress, u32, u8), bool>, // (player, puzzle_id, hint_level) -> purchased
+        player_features: Map<(ContractAddress, felt252, u32), bool>, // (player, feature_type, feature_id) -> unlocked
+        // Cooldowns
+        last_purchase: Map<ContractAddress, u64>, // player -> timestamp
+        daily_spend: Map<ContractAddress, u256>, // player -> amount spent today
+        daily_spend_reset: Map<ContractAddress, u64>, // player -> last reset timestamp
+        // Bundles and Sales
+        bundles: Map<u32, Bundle>,
+        active_sales: Map<u32, Sale>,
+        next_sale_id: u32,
+        
+        // Staking
+        staked_balances: Map<ContractAddress, u256>,
+        staking_start_time: Map<ContractAddress, u64>,
+        staking_rewards: Map<ContractAddress, u256>,
+        total_staked: u256,
+        
+        // Referral system
+        referrals: Map<ContractAddress, ContractAddress>, // referee => referrer
+        referral_counts: Map<ContractAddress, u32>,
+        referral_rewards: Map<ContractAddress, u256>,
+        
+        // Constants
+        DAILY_SPEND_LIMIT: u256,
+        PURCHASE_COOLDOWN: u64,
+        REFERRAL_REWARD_PERCENT: u8,
+        STAKING_APY: u64, // APY as basis points (e.g., 500 = 5%)
+        MIN_STAKING_DURATION: u64, // seconds
+        MAX_STAKING_DURATION: u64, // seconds
         // Streak tracking
         last_day_timestamp: Map<
             ContractAddress, u64,
@@ -100,15 +239,34 @@ pub mod LogicQuestPlayerProfile {
 
     // Constructor
     #[constructor]
-    fn constructor(
-        ref self: ContractState, admin_address: ContractAddress, token_contract: ContractAddress,
-    ) {
-        self.admin.write(admin_address);
+    fn constructor(ref self: ContractState, token_contract: ContractAddress) {
+        self.admin.write(get_caller_address());
         self.token_contract.write(token_contract);
-        self.players_count.write(0);
-        self.levels_count.write(0);
-
-        // Create default levels
+        
+        // Set default costs (can be updated by admin)
+        self.hint_costs.write(1, u256!(100)); // Basic hint
+        self.hint_costs.write(2, u256!(250)); // Advanced hint
+        self.hint_costs.write(3, u256!(500)); // Solution hint
+        
+        // Set default feature costs
+        self.feature_costs.write('theme_rare', u256!(1000));
+        self.feature_costs.write('theme_legendary', u256!(2500));
+        self.feature_costs.write('powerup_extra_time', u256!(500));
+        self.feature_costs.write('powerup_skip_puzzle', u256!(1000));
+        
+        // Set constants
+        self.DAILY_SPEND_LIMIT.write(u256!(10000));
+        self.PURCHASE_COOLDOWN.write(86400); // 24 hours in seconds
+        self.REFERRAL_REWARD_PERCENT.write(5); // 5% referral reward
+        self.STAKING_APY.write(1500); // 15% APY for staking
+        self.MIN_STAKING_DURATION.write(7 * 86400); // 7 days
+        self.MAX_STAKING_DURATION.write(365 * 86400); // 1 year
+        
+        // Initialize counters
+        self.next_sale_id.write(0);
+        self.next_bundle_id.write(0);
+        self.total_staked.write(0);
+        
         self._create_default_levels();
     }
 
@@ -422,9 +580,465 @@ pub mod LogicQuestPlayerProfile {
         }
     }
 
+    // Bundle and Sale structures
+    #[derive(Drop, Serde)]
+    struct Bundle {
+        id: u32,
+        name: felt252,
+        items: Array<(felt252, u32)>, // (item_type, item_id)
+        total_cost: u256,
+        discount_percent: u8,
+        is_active: bool,
+    }
+    
+    #[derive(Drop, Serde)]
+    struct Sale {
+        id: u32,
+        item_type: felt252,
+        item_id: u32,
+        original_cost: u256,
+        sale_cost: u256,
+        start_time: u64,
+        end_time: u64,
+        is_active: bool,
+    }
+    
+    // Staking position
+    #[derive(Drop, Serde)]
+    struct StakingPosition {
+        amount: u256,
+        start_time: u64,
+        unlock_time: u64,
+        claimed: bool,
+    }
+
+    // Implement token spending functionality
+    #[generate_trait]
+    impl PlayerTokenSpendingImpl of IPlayerTokenSpending<ContractState> {
+        // ... existing functions ...
+        
+        // New functions for bundles and sales
+        fn create_bundle(
+            ref self: ContractState,
+            name: felt252,
+            items: Array<(felt252, u32)>,
+            total_cost: u256,
+            discount_percent: u8
+        ) -> u32 {
+            self.only_admin();
+            let bundle_id = self.next_bundle_id.read() + 1;
+            self.next_bundle_id.write(bundle_id);
+            
+            let bundle = Bundle {
+                id: bundle_id,
+                name,
+                items,
+                total_cost,
+                discount_percent,
+                is_active: true,
+            };
+            
+            self.bundles.write(bundle_id, bundle);
+            bundle_id
+        }
+        
+        fn purchase_bundle(
+            ref self: ContractState,
+            bundle_id: u32,
+            referral_code: Option<ContractAddress>
+        ) {
+            let caller = get_caller_address();
+            self._check_cooldown(caller);
+            
+            let bundle = self.bundles.read(bundle_id);
+            assert(bundle.is_active, 'Bundle not available');
+            
+            // Process payment with discount
+            let final_cost = bundle.total_cost * (100 - bundle.discount_percent.into()) / 100;
+            self._spend_tokens(caller, final_cost, 'bundle', bundle_id);
+            
+            // Unlock all items in the bundle
+            let mut item_ids = ArrayTrait::new();
+            let mut i = 0;
+            loop {
+                match bundle.items.at(i) {
+                    Option::Some((item_type, item_id)) => {
+                        let feature_key = (caller, item_type, item_id);
+                        self.player_features.write(feature_key, true);
+                        item_ids.append(item_id);
+                        i += 1;
+                    },
+                    Option::None => { break; },
+                };
+            }
+            
+            // Process referral if provided
+            self._process_referral(referral_code, final_cost);
+            
+            self.emit(BundlePurchased {
+                player: caller,
+                bundle_id,
+                items: item_ids,
+                total_cost: final_cost,
+                discount: bundle.discount_percent.into(),
+            });
+        }
+        
+        fn start_sale(
+            ref self: ContractState,
+            item_type: felt252,
+            item_id: u32,
+            original_cost: u256,
+            discount_percent: u8,
+            duration_days: u64
+        ) -> u32 {
+            self.only_admin();
+            let sale_id = self.next_sale_id.read() + 1;
+            self.next_sale_id.write(sale_id);
+            
+            let start_time = get_block_timestamp();
+            let end_time = start_time + (duration_days * 86400); // days to seconds
+            
+            let sale_cost = original_cost * (100 - discount_percent.into()) / 100;
+            
+            let sale = Sale {
+                id: sale_id,
+                item_type,
+                item_id,
+                original_cost,
+                sale_cost,
+                start_time,
+                end_time,
+                is_active: true,
+            };
+            
+            self.active_sales.write(sale_id, sale);
+            
+            self.emit(SaleStarted {
+                sale_id,
+                item_type,
+                item_id,
+                discount_percent,
+                start_time,
+                end_time,
+            });
+            
+            sale_id
+        }
+        
+        // Staking functions
+        fn stake_tokens(ref self: ContractState, amount: u256, duration_days: u64) {
+            let caller = get_caller_address();
+            let current_time = get_block_timestamp();
+            
+            // Validate staking duration
+            let duration_seconds = duration_days * 86400;
+            assert(
+                duration_seconds >= self.MIN_STAKING_DURATION.read() && 
+                duration_seconds <= self.MAX_STAKING_DURATION.read(),
+                'Invalid staking duration'
+            );
+            
+            // Transfer tokens from player to contract
+            let token_contract = self.token_contract.read();
+            let token_dispatcher = ISTARKDispatcher { contract_address: token_contract };
+            
+            let success = token_dispatcher.transfer_from(caller, contract_address!(), amount);
+            assert(success, 'Token transfer failed');
+            
+            // Update staking position
+            let unlock_time = current_time + duration_seconds;
+            let staked_amount = self.staked_balances.read(caller) + amount;
+            self.staked_balances.write(caller, staked_amount);
+            self.staking_start_time.write(caller, current_time);
+            self.total_staked.write(self.total_staked.read() + amount);
+            
+            self.emit(TokensStaked {
+                player: caller,
+                amount,
+                unlock_time,
+            });
+        }
+        
+        fn unstake_tokens(ref self: ContractState) -> (u256, u256) {
+            let caller = get_caller_address();
+            let current_time = get_block_timestamp();
+            
+            let staked_amount = self.staked_balances.read(caller);
+            assert(staked_amount > 0, 'No staked tokens');
+            
+            let start_time = self.staking_start_time.read(caller);
+            assert(current_time >= start_time, 'Invalid staking period');
+            
+            // Calculate rewards (simple interest)
+            let staking_duration = current_time - start_time;
+            let apy = self.STAKING_APY.read().into();
+            let rewards = (staked_amount * apy * staking_duration.into()) / (10000 * 31536000); // APY to per-second rate
+            
+            // Transfer staked amount + rewards back to player
+            let token_contract = self.token_contract.read();
+            let token_dispatcher = ISTARKDispatcher { contract_address: token_contract };
+            
+            let total_amount = staked_amount + rewards;
+            let success = token_dispatcher.transfer(caller, total_amount);
+            assert(success, 'Token transfer failed');
+            
+            // Update state
+            self.staked_balances.write(caller, 0);
+            self.staking_start_time.write(caller, 0);
+            self.total_staked.write(self.total_staked.read() - staked_amount);
+            
+            self.emit(TokensUnstaked {
+                player: caller,
+                amount: staked_amount,
+                reward: rewards,
+            });
+            
+            (staked_amount, rewards)
+        }
+        
+        // Referral system
+        fn register_referral(ref self: ContractState, referrer: ContractAddress) {
+            let caller = get_caller_address();
+            assert(caller != referrer, 'Cannot refer yourself');
+            
+            // Check if already referred
+            assert(
+                !self.referrals.read(caller).is_some(),
+                'Already registered with a referrer'
+            );
+            
+            // Register referral
+            self.referrals.write(caller, referrer);
+            
+            // Update referral count
+            let ref_count = self.referral_counts.read(referrer) + 1;
+            self.referral_counts.write(referrer, ref_count);
+            
+            self.emit(ReferralRegistered {
+                referrer,
+                referee: caller,
+            });
+        }
+        
+        // Internal function to process referral rewards
+        fn _process_referral(
+            ref self: ContractState,
+            referrer_opt: Option<ContractAddress>,
+            purchase_amount: u256
+        ) {
+            match referrer_opt {
+                Option::Some(referrer) => {
+                    // Check if referrer exists and is valid
+                    if referrer != ContractAddress::ZERO && 
+                       self.referral_counts.read(referrer) > 0 {
+                        
+                        let reward = purchase_amount * self.REFERRAL_REWARD_PERCENT.into() / 100;
+                        if reward > 0 {
+                            // Update referrer's rewards
+                            let total_rewards = self.referral_rewards.read(referrer) + reward;
+                            self.referral_rewards.write(referrer, total_rewards);
+                            
+                            // Emit event
+                            self.emit(ReferralRewardPaid {
+                                referrer,
+                                amount: reward,
+                                referee: get_caller_address(),
+                            });
+                        }
+                    }
+                },
+                Option::None => {}
+            };
+        }
+        
+        // Admin function to update staking parameters
+        fn update_staking_params(
+            ref self: ContractState,
+            min_duration: u64,
+            max_duration: u64,
+            apy: u64
+        ) {
+            self.only_admin();
+            self.MIN_STAKING_DURATION.write(min_duration);
+            self.MAX_STAKING_DURATION.write(max_duration);
+            self.STAKING_APY.write(apy);
+        }
+        
+        // Admin function to update referral reward percentage
+        fn update_referral_reward(ref self: ContractState, reward_percent: u8) {
+            self.only_admin();
+            assert(reward_percent <= 100, 'Invalid reward percentage');
+            self.REFERRAL_REWARD_PERCENT.write(reward_percent);
+        }
+        fn purchase_hint(
+            ref self: ContractState,
+            puzzle_id: u32,
+            hint_level: u8,
+            hint_text: felt252
+        ) {
+            let caller = get_caller_address();
+            self._check_cooldown(caller);
+            
+            // Check if hint already purchased
+            let hint_key = (caller, puzzle_id, hint_level);
+            assert(!self.player_hints.read(hint_key), 'Hint already purchased');
+            
+            // Get and verify hint cost
+            let cost = self.hint_costs.read(hint_level);
+            assert(!cost.is_zero(), 'Invalid hint level');
+            
+            // Process payment
+            self._spend_tokens(caller, cost, 'hint', hint_level.into());
+            
+            // Unlock hint
+            self.player_hints.write(hint_key, true);
+            
+            // Emit event
+            self.emit(HintPurchased {
+                player: caller,
+                puzzle_id,
+                hint_level,
+                hint_text,
+                cost,
+            });
+        }
+        
+        fn unlock_feature(
+            ref self: ContractState,
+            feature_type: felt252,
+            feature_id: u32
+        ) {
+            let caller = get_caller_address();
+            self._check_cooldown(caller);
+            
+            // Check if feature already unlocked
+            let feature_key = (caller, feature_type, feature_id);
+            assert(!self.player_features.read(feature_key), 'Feature already unlocked');
+            
+            // Get and verify feature cost
+            let cost = self.feature_costs.read(feature_type);
+            assert(!cost.is_zero(), 'Invalid feature type');
+            
+            // Process payment
+            self._spend_tokens(caller, cost, 'feature', feature_id);
+            
+            // Unlock feature
+            self.player_features.write(feature_key, true);
+            
+            // Emit event
+            self.emit(FeatureUnlocked {
+                player: caller,
+                feature_type,
+                feature_id,
+                cost,
+            });
+        }
+        
+        fn set_hint_cost(ref self: ContractState, hint_level: u8, cost: u256) {
+            self.only_admin();
+            self.hint_costs.write(hint_level, cost);
+        }
+        
+        fn set_feature_cost(ref self: ContractState, feature_type: felt252, cost: u256) {
+            self.only_admin();
+            self.feature_costs.write(feature_type, cost);
+        }
+        
+        fn get_daily_spend(self: @ContractState, player: ContractAddress) -> (u256, u256) {
+            self._check_daily_reset(player);
+            (self.daily_spend.read(player), self.DAILY_SPEND_LIMIT.read())
+        }
+        
+        fn has_feature(
+            self: @ContractState,
+            player: ContractAddress,
+            feature_type: felt252,
+            feature_id: u32
+        ) -> bool {
+            self.player_features.read((player, feature_type, feature_id))
+        }
+        
+        fn has_hint(
+            self: @ContractState,
+            player: ContractAddress,
+            puzzle_id: u32,
+            hint_level: u8
+        ) -> bool {
+            self.player_hints.read((player, puzzle_id, hint_level))
+        }
+    }
+    
     // Internal functions
     #[generate_trait]
     impl InternalFunctions of InternalFunctionsTrait {
+        fn _spend_tokens(
+            ref self: ContractState,
+            player: ContractAddress,
+            amount: u256,
+            feature_type: felt252,
+            feature_id: u32
+        ) {
+            // Check daily spend limit
+            self._check_daily_reset(player);
+            let mut daily_spend = self.daily_spend.read(player);
+            let new_daily_spend = daily_spend + amount;
+            assert(
+                new_daily_spend <= self.DAILY_SPEND_LIMIT.read(),
+                'Daily spend limit exceeded'
+            );
+            self.daily_spend.write(player, new_daily_spend);
+            
+            // Transfer tokens from player to contract
+            let token_contract = self.token_contract.read();
+            let token_dispatcher = ISTARKDispatcher { contract_address: token_contract };
+            
+            // Check allowance and balance
+            let allowance = token_dispatcher.allowance(player, contract_address!());
+            let balance = token_dispatcher.balance_of(player);
+            
+            assert(allowance >= amount, 'Insufficient token allowance');
+            assert(balance >= amount, 'Insufficient token balance');
+            
+            // Transfer tokens
+            let success = token_dispatcher.transfer_from(player, contract_address!(), amount);
+            assert(success, 'Token transfer failed');
+            
+            // Update last purchase timestamp
+            self.last_purchase.write(player, get_block_timestamp());
+            
+            // Emit event
+            self.emit(TokensSpent {
+                player,
+                amount,
+                feature_type,
+                feature_id,
+            });
+        }
+        
+        fn _check_cooldown(ref self: ContractState, player: ContractAddress) {
+            let last_purchase = self.last_purchase.read(player);
+            let cooldown = self.PURCHASE_COOLDOWN.read();
+            let current_time = get_block_timestamp();
+            
+            if !last_purchase.is_zero() {
+                let time_since_last = current_time - last_purchase;
+                assert(time_since_last >= cooldown, 'Purchase cooldown active');
+            }
+        }
+        
+        fn _check_daily_reset(ref self: ContractState, player: ContractAddress) {
+            let last_reset = self.daily_spend_reset.read(player);
+            let current_time = get_block_timestamp();
+            
+            // Reset daily spend if it's a new day
+            if last_reset.is_zero() || (current_time - last_reset) >= 86400 { // 24 hours in seconds
+                self.daily_spend.write(player, u256!(0));
+                self.daily_spend_reset.write(player, current_time);
+            }
+        }
+        
+        fn _create_default_levels(ref self: ContractState) {
         fn _create_default_levels(ref self: ContractState) {
             // Level 1 (Starting level)
             let level_id = self.levels_count.read() + 1;
